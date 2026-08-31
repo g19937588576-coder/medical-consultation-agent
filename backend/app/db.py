@@ -47,6 +47,18 @@ if not _db_path.is_absolute():
     _db_path = Path(__file__).resolve().parent.parent / _db_path
 _db_path.parent.mkdir(parents=True, exist_ok=True)
 
+class KbVectorRecord(SQLModel, table=True):
+    __tablename__ = "kb_vectors"
+    entry_id: str = Field(primary_key=True)
+    vector_json: str = ""
+
+
+class KbMetaRecord(SQLModel, table=True):
+    __tablename__ = "kb_meta"
+    key: str = Field(primary_key=True)
+    value: str = ""
+
+
 engine = create_engine(
     f"sqlite:///{_db_path.as_posix()}",
     connect_args={"check_same_thread": False},
@@ -166,4 +178,5 @@ def set_cached_tool(tool_name: str, args: dict, result: dict) -> None:
                 )
             )
         db.commit()
+
 

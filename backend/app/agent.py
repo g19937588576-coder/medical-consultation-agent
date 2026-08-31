@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableConfig
 from . import safety
 from .config import settings
 from .llm import chat, chat_stream, parse_json
+from .knowledge_base import kb_citations
 from .mcp_tools import extract_citations, mcp_client
 
 SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基于权威医学资料的健康信息咨询。
@@ -470,7 +471,8 @@ async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
     )
     prompt = (
         "你是医学文献相关性评审员。判断每篇文献与用户问题的相关性："
-        "只有与用户问题属于同一具体疾病/症状领域且能提供有用信息的文献给 4-5 分；"
+        "只要与用户问题属于同一疾病/症状领域（例如都是高血压、都是头痛、都是恶心呕吐），且能提供有用信息，就给 4-5 分；"
+        "不要因为缺少『最新/研究进展』等修饰词而降低科普条目的评分。"
         "仅泛泛相关（如同部位但完全不同的问题）给 3 分；无关给 1-2 分。"
         "对每篇文献输出一个 1-5 分的相关度评分。"
         '只输出 JSON：{"scores": [按顺序对应每篇文献的分数]}，不要输出其他内容。\n'
@@ -500,41 +502,57 @@ async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
 
 async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     intent = state.get("intent", "other")
+    intent_eff = _effective_intent(state)
     citations: list[dict] = []
     user_input = state.get("user_input", "")
     facts = state.get("facts") or {}
 
+    # 知识库检索用「原始症状 + 追问细节」作为查询（以档案症状为锚，不受最新一条消息影响）
+    kb_query = user_input
+    if intent_eff == "symptom":
+        kb_query = str(facts.get("symptom") or "") or user_input
+        details = str(facts.get("symptom_details") or "").strip()
+        if details:
+            # 过滤否定句（没有…/无…/不…），避免污染检索语义
+            parts = [
+                p.strip()
+                for p in re.split(r"[；;，,。]", details)
+                if p.strip() and not re.match(r"^(没有|无|没有其他|不|未)", p.strip())
+            ]
+            if parts:
+                kb_query = f"{kb_query}；{'；'.join(parts)}"
+
     if intent == "drug":
+        # FDA 为主，知识库为补充（不做重排，避免误删权威药典）
         drugs = await _extract_drugs(user_input)
         if not drugs:
             drugs = [await _to_english(user_input, "药品")]
+        fda_cits: list[dict] = []
         for drug in drugs[:2]:
             _push(config, {"type": "tool_call", "tool": "search-drugs", "label": f"正在查询 FDA 药品数据库：{drug}…"})
             result = await mcp_client.call_tool("search-drugs", {"query": drug, "limit": 3})
-            citations.extend(extract_citations("search-drugs", result.get("data") or {}))
+            fda_cits.extend(extract_citations("search-drugs", result.get("data") or {}))
+        _push(config, {"type": "tool_call", "tool": "knowledge-base", "label": "正在检索本地健康知识库…"})
+        citations = fda_cits + kb_citations(kb_query)
     else:
+        # 混合检索：本地知识库（向量语义，信任向量相关性，直接取前 2 条）+ PubMed（关键词，LLM 严格重排）
+        _push(config, {"type": "tool_call", "tool": "knowledge-base", "label": "正在检索本地健康知识库…"})
+        kb_cits = kb_citations(kb_query)[:2]
         if intent == "literature":
             query_text, kind = user_input, "研究主题"
-        elif intent == "symptom":
-            query_text, kind = _literature_query(state), "症状"
+        elif intent_eff == "symptom":
+            query_text, kind = kb_query, "症状"
         else:
             query_text, kind = user_input, "健康问题"
         pubmed_q = await _build_pubmed_query(query_text, kind)
         _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在检索 PubMed 医学文献…"})
         result = await mcp_client.call_tool("search-medical-literature", {"query": pubmed_q, "max_results": 5})
-        citations.extend(extract_citations("search-medical-literature", result.get("data") or {}))
-        # 相关性过滤（核心防线）：只保留与用户问题直接相关的文献
-        if citations:
-            rerank_q = query_text
-            if intent == "symptom":
-                rerank_q = str(facts.get("symptom") or "") or query_text
-                details = str(facts.get("symptom_details") or "").strip()
-                if details:
-                    rerank_q = f"{rerank_q}；{details}"
-            citations = await _rerank_citations(rerank_q, citations)
+        pubmed_cits = extract_citations("search-medical-literature", result.get("data") or {})
+        rerank_q = kb_query if intent_eff == "symptom" else user_input
+        pubmed_kept = await _rerank_citations(rerank_q, pubmed_cits) if pubmed_cits else []
+        citations = kb_cits + pubmed_kept
 
     return {"citations": citations[:3]}
-
 
 def _tool_summary(state: AgentState) -> str:
     citations = state.get("citations") or []
@@ -599,12 +617,22 @@ async def synthesize_node(state: AgentState, config: RunnableConfig) -> dict:
     return {"output": full, "triage_level": triage, "reason": "answer", "done": True}
 
 
+def _effective_intent(state: AgentState) -> str:
+    """只要档案里有原始症状，且当前意图不是明确的药品/文献类，就按症状问诊处理，
+    避免"持续一个多月了"这类追问回复被误判为其他意图后丢失症状锚点。"""
+    intent = state.get("intent", "other")
+    facts = state.get("facts") or {}
+    if intent in ("symptom", "other") and str(facts.get("symptom") or "").strip():
+        return "symptom"
+    return intent
+
+
 def _route_after_safety(state: AgentState) -> str:
     return "end" if state.get("done") else "understand"
 
 
 def _route_after_understand(state: AgentState) -> str:
-    if state.get("intent") != "symptom":
+    if _effective_intent(state) != "symptom":
         return "tools"
     rounds = state.get("question_rounds", 0)
     mem = get_session_memory(state.get("session_id", 0))
@@ -630,6 +658,12 @@ def build_graph():
 
 
 agent_graph = build_graph()
+
+
+
+
+
+
 
 
 

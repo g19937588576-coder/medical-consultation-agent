@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     # 问诊行为
     max_question_rounds: int = 12
 
+    # 本地中文健康知识库（向量检索）
+    kb_enabled: bool = True
+    kb_model: str = "BAAI/bge-small-zh-v1.5"
+    kb_top_k: int = 3
+    kb_data_file: str = "data/knowledge_base.json"
+    hf_endpoint: str = "https://hf-mirror.com"
+
     # 前端来源（CORS）
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
@@ -45,5 +52,6 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
 
 

@@ -30,3 +30,7 @@ backend/debug_h2.py
 backend/debug_r.py
 backend/debug_search.py
 backend/debug_translate.py
+backend/test_*.py
+backend/debug_*.py
+backend/e2e_*.py
+backend/eval_result.txt
