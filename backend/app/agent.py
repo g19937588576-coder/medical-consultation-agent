@@ -12,7 +12,7 @@ from langchain_core.runnables import RunnableConfig
 from . import safety
 from .config import settings
 from .llm import chat, chat_stream, parse_json
-from .knowledge_base import kb_citations
+from .knowledge_base import search_kb
 from .mcp_tools import extract_citations, mcp_client
 
 SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基于权威医学资料的健康信息咨询。
@@ -29,6 +29,7 @@ SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基�
 7. 引用编号只能引用「参考资料列表」中实际存在的条目。如果参考资料列表为空（本次没有检索到资料），禁止使用 [1][2] 这类引用标注，应直接说明资料不足。
 8. 引用纪律：只有当某篇文献与用户的问题/症状直接相关时，才允许引用它。参考资料列表中不相关的文献一律不得引用、不得提及。宁可完全没有引用，也不要引用不相关文献。
 9. 必须围绕用户最初描述的症状（「主要症状」与「补充症状细节」字段）作答，即使用户最新一条消息很短。如果检索资料与主要症状不相关，请明确说明"检索到的资料与您描述的症状不直接相关"，并基于常见健康常识给出针对该症状的保守建议（例如牙痛→保持口腔清洁、避免过冷过热刺激、尽快就诊口腔科），严禁给出与用户症状无关的部位建议（如腹部、胸部、腰部等）。
+10. 「内部科普参考」仅供您撰写建议性内容（饮食、护理、就医时机等）时参考，**不可作为引用来源**：不要给它们标注 [n] 编号，不要在"参考资料"中体现，也不要声称"论文指出"。引用编号只能对应「参考资料列表」中的论文。
 """
 
 
@@ -40,6 +41,7 @@ class AgentState(TypedDict, total=False):
     facts: dict                 # 已收集的健康档案（profile 的别名）
     question_rounds: int
     citations: list[dict]
+    kb_notes: list[dict]
     triage_level: str | None
     output: str
     reason: str                 # forgot/view/emergency/refusal/diagnosis/question/answer
@@ -156,6 +158,34 @@ SYMPTOM_QUESTIONS: list[tuple[str, list[str], list[str]]] = [
 ]
 GENERIC_SYMPTOM_QUESTION = "能不能再多描述一些症状细节？比如具体位置、感觉和什么情况下会加重。"
 SYMPTOM_Q_MAX = 3  # 每类最多追问的对症问题数
+
+# 症状类别 → PubMed 相关/相似症状英文术语（用于扩展检索，保证能给出几篇相关论文）
+CATEGORY_EN_TERMS: dict[str, list[str]] = {
+    "dental": ["toothache", "dental pain", "odontalgia"],
+    "headache": ["headache", "migraine", "tension-type headache"],
+    "nausea": ["nausea", "vomiting", "dyspepsia"],
+    "abdominal": ["abdominal pain", "dyspepsia", "gastroenteritis"],
+    "back": ["low back pain", "lumbago", "mechanical back pain"],
+    "joint": ["joint pain", "arthralgia", "osteoarthritis"],
+    "cough": ["cough", "acute cough", "chronic cough"],
+    "fever": ["fever", "pyrexia", "fever of unknown origin"],
+    "rash": ["rash", "pruritus", "urticaria"],
+    "throat": ["sore throat", "pharyngitis", "laryngitis"],
+    "chest": ["chest pain", "dyspnea", "chest tightness"],
+    "dizzy": ["vertigo", "dizziness", "benign paroxysmal positional vertigo"],
+    "fatigue": ["fatigue", "asthenia", "chronic fatigue"],
+}
+
+
+def _category_pubmed_query(cat: str | None) -> str:
+    """按症状类别拼 PubMed 查询（引号 + [Title/Abstract] + OR）。"""
+    if not cat:
+        return ""
+    terms = CATEGORY_EN_TERMS.get(cat) or []
+    if not terms:
+        return ""
+    clauses = [f'"{t}"[Title/Abstract]' for t in terms[:3]]
+    return " OR ".join(clauses)
 
 
 def get_session_memory(session_id: int) -> dict[str, Any]:
@@ -493,7 +523,7 @@ async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
                 s = int(score)
             except Exception:
                 continue
-            if s >= 4 and i < len(citations):
+            if s >= 3 and i < len(citations):
                 kept.append(citations[i])
         return kept[:3]
     except Exception:
@@ -504,6 +534,7 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     intent = state.get("intent", "other")
     intent_eff = _effective_intent(state)
     citations: list[dict] = []
+    kb_notes: list[dict] = []
     user_input = state.get("user_input", "")
     facts = state.get("facts") or {}
 
@@ -522,37 +553,56 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
             if parts:
                 kb_query = f"{kb_query}；{'；'.join(parts)}"
 
+    # 知识库只作内部参考（不展示、不进入参考资料）
+    _push(config, {"type": "tool_call", "tool": "knowledge-base", "label": "正在检索本地健康知识库…"})
+    for e in search_kb(kb_query, top_k=2):
+        kb_notes.append(
+            {
+                "title": str(e.get("title") or ""),
+                "content": str(e.get("content") or "")[:400],
+                "advice": str(e.get("advice") or "")[:200],
+            }
+        )
+
     if intent == "drug":
-        # FDA 为主，知识库为补充（不做重排，避免误删权威药典）
+        # 药品：FDA 为主（不重排，避免误删权威药典）
         drugs = await _extract_drugs(user_input)
         if not drugs:
             drugs = [await _to_english(user_input, "药品")]
-        fda_cits: list[dict] = []
         for drug in drugs[:2]:
             _push(config, {"type": "tool_call", "tool": "search-drugs", "label": f"正在查询 FDA 药品数据库：{drug}…"})
             result = await mcp_client.call_tool("search-drugs", {"query": drug, "limit": 3})
-            fda_cits.extend(extract_citations("search-drugs", result.get("data") or {}))
-        _push(config, {"type": "tool_call", "tool": "knowledge-base", "label": "正在检索本地健康知识库…"})
-        citations = fda_cits + kb_citations(kb_query)
+            citations.extend(extract_citations("search-drugs", result.get("data") or {}))
     else:
-        # 混合检索：本地知识库（向量语义，信任向量相关性，直接取前 2 条）+ PubMed（关键词，LLM 严格重排）
-        _push(config, {"type": "tool_call", "tool": "knowledge-base", "label": "正在检索本地健康知识库…"})
-        kb_cits = kb_citations(kb_query)[:2]
         if intent == "literature":
             query_text, kind = user_input, "研究主题"
         elif intent_eff == "symptom":
             query_text, kind = kb_query, "症状"
         else:
             query_text, kind = user_input, "健康问题"
-        pubmed_q = await _build_pubmed_query(query_text, kind)
+        # 症状类：合并「类别相似症状术语」+「LLM 翻译」两路检索，候选更全
+        cat = _detect_symptom_category(facts, user_input) if intent_eff == "symptom" else None
+        pubmed_cits: list[dict] = []
+        seen_titles: set[str] = set()
+        pubmed_q = _category_pubmed_query(cat) if cat else await _build_pubmed_query(query_text, kind)
         _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在检索 PubMed 医学文献…"})
-        result = await mcp_client.call_tool("search-medical-literature", {"query": pubmed_q, "max_results": 5})
-        pubmed_cits = extract_citations("search-medical-literature", result.get("data") or {})
+        result = await mcp_client.call_tool("search-medical-literature", {"query": pubmed_q, "max_results": 8})
+        for c in extract_citations("search-medical-literature", result.get("data") or {}):
+            if c.get("title") not in seen_titles:
+                seen_titles.add(c.get("title"))
+                pubmed_cits.append(c)
+        if cat:
+            pubmed_q2 = await _build_pubmed_query(query_text, kind)
+            if pubmed_q2 and pubmed_q2 != pubmed_q:
+                result2 = await mcp_client.call_tool("search-medical-literature", {"query": pubmed_q2, "max_results": 5})
+                for c in extract_citations("search-medical-literature", result2.get("data") or {}):
+                    if c.get("title") not in seen_titles:
+                        seen_titles.add(c.get("title"))
+                        pubmed_cits.append(c)
         rerank_q = kb_query if intent_eff == "symptom" else user_input
-        pubmed_kept = await _rerank_citations(rerank_q, pubmed_cits) if pubmed_cits else []
-        citations = kb_cits + pubmed_kept
+        citations = await _rerank_citations(rerank_q, pubmed_cits) if pubmed_cits else []
 
-    return {"citations": citations[:3]}
+    return {"citations": citations[:3], "kb_notes": kb_notes[:2]}
 
 def _tool_summary(state: AgentState) -> str:
     citations = state.get("citations") or []
@@ -586,6 +636,13 @@ async def synthesize_node(state: AgentState, config: RunnableConfig) -> dict:
     content += f"\n\n资料：\n{_tool_summary(state)}\n\n参考资料列表：\n" + "\n".join(
         f"{i}. {c.get('title')}（{c.get('source')}）{c.get('url')}" for i, c in enumerate(citations, 1)
     ) if citations else "参考资料列表：（无）"
+    kb_notes = state.get("kb_notes") or []
+    if kb_notes:
+        notes = "\n".join(
+            f"- {n.get('title', '')}：{(n.get('content') or '')[:240]}{('；建议：' + n.get('advice', '')) if n.get('advice') else ''}"
+            for n in kb_notes[:2]
+        )
+        content += f"\n\n内部科普参考（仅供撰写建议性内容参考，不展示、不可引用、不要出现编号）：\n{notes}"
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -658,6 +715,10 @@ def build_graph():
 
 
 agent_graph = build_graph()
+
+
+
+
 
 
 
