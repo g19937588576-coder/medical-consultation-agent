@@ -26,12 +26,13 @@ COPY backend/app ./app
 COPY --from=frontend /app/frontend/dist ./static
 
 # 打补丁：medical-mcp 的 console.log 会污染 MCP stdio 协议，全部改到 stderr
-RUN node -e "const fs=require('fs');const p=require('child_process').execSync('npm root -g').toString().trim()+'/medical-mcp/build';for(const f of fs.readdirSync(p)){if(!f.endsWith('.js'))continue;const fp=p+'/'+f;let s=fs.readFileSync(fp,'utf8');s=s.replace(/console\\.log\\(/g,'console.error(');fs.writeFileSync(fp,s);}"
+RUN node -e "const fs=require('fs');const p=require('child_process').execSync('npm root -g').toString().trim()+'/medical-mcp/build';for(const f of fs.readdirSync(p)){if(!f.endsWith('.js'))continue;const fp=p+'/'+f;let s=fs.readFileSync(fp,'utf8');s=s.replace(/console\\.log\\(/g,'console.error(');s=s.replace(/retmax: maxResults,/g,'retmax: maxResults, sort: "relevance",');fs.writeFileSync(fp,s);}"
 
 ENV PORT=8000
 ENV MCP_SERVER_COMMAND=medical-mcp
 ENV MCP_SERVER_ARGS=[]
 EXPOSE 8000
 CMD ["sh", "-c", "uv run --no-sync uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
 
 
