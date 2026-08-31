@@ -23,3 +23,10 @@ backend/e2e_tooth.py
 docs/screenshots/debug.png
 backend/debug_*.py
 backend/e2e_verify.py
+backend/e2e_symptoms.py
+backend/e2e_final.py
+backend/debug_h.py
+backend/debug_h2.py
+backend/debug_r.py
+backend/debug_search.py
+backend/debug_translate.py

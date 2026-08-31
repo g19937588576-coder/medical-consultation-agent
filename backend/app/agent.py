@@ -19,7 +19,7 @@ SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基�
 必须遵守的边界：
 1. 你不是医生，不提供诊断，不开处方。永远不要给出明确诊断结论或具体用药方案。
 2. 只能基于「资料」字段中提供的检索结果进行回答，回答中的每条关键信息必须标注引用编号 [1][2]…，对应「参考资料列表」。严禁编造来源。
-3. 仅当用户咨询的是症状（描述身体不适）时，回答结尾必须单独一行输出分诊建议，格式严格为：
+3. 仅当用户咨询的是症状（描述身体不适）时，回答结尾**必须且只能**单独一行输出分诊建议（不要遗漏），格式严格为：
    分诊等级：🟢（可自行观察）/ 🟡（建议尽快就医）/ 🔴（需立即急诊）——简短理由
    药品、文献、一般健康话题的问题不要输出分诊等级行。
 4. 回答使用简体中文，通俗易懂，长度适中（300 字以内），先给结论再给解释。
@@ -92,6 +92,16 @@ SYMPTOM_QUESTIONS: list[tuple[str, list[str], list[str]]] = [
         "牙龈有没有红肿、出血或鼓包？",
         "疼痛是遇冷、热、甜食才疼，还是不吃东西也自发地疼？",
         "有没有夜间加重，或牵扯到脸颊、耳朵的疼痛？",
+    ]),
+    ("nausea", ["恶心", "呕吐", "反胃", "想吐", "干呕"], [
+        "恶心和吃饭有关系吗？是空腹明显还是饭后明显？",
+        "是干呕还是真的吐出来了？吐出来的是什么？",
+        "有没有伴随腹痛、腹泻、发热或头晕？",
+    ]),
+    ("back", ["腰", "背"], [
+        "疼痛是酸胀还是刺痛？持续多久了？",
+        "弯腰、久坐或负重的时候会不会加重？",
+        "有没有放射到腿部、或者腿麻、无力？",
     ]),
     ("abdominal", ["肚子", "腹", "胃", "肚脐", "肠"], [
         "疼痛的具体位置在哪（上腹、下腹还是肚脐周围）？",
@@ -207,8 +217,11 @@ def _consent_reply(text: str) -> bool | None:
 
 
 def _detect_symptom_category(profile: dict, user_input: str) -> str | None:
-    """按主要症状 + 当前消息的关键词匹配出对症类别。"""
-    text = (str(profile.get("symptom") or "") + " " + str(user_input or "")).lower()
+    """按原始症状（profile.symptom）的关键词匹配出对症类别；仅在原始症状缺失时回退到当前消息。"""
+    text = str(profile.get("symptom") or "").strip()
+    if not text:
+        text = str(user_input or "")
+    text = text.lower()
     for cat, keywords, _ in SYMPTOM_QUESTIONS:
         for kw in keywords:
             if kw in text:
@@ -223,9 +236,12 @@ def _symptom_questions_for(cat: str) -> list[str]:
     return []
 
 
-def _missing_profile(profile: dict) -> list[str]:
-    order = ["age", "allergies", "duration", "severity", "conditions", "medications"]
-    return [k for k in order if not str(profile.get(k) or "").strip()]
+PROFILE_ASK_ORDER = ["age", "allergies", "duration", "severity", "conditions", "medications"]
+
+
+def _missing_profile(profile: dict, asked: list | None = None) -> list[str]:
+    asked = asked or []
+    return [k for k in PROFILE_ASK_ORDER if not str(profile.get(k) or "").strip() and k not in asked]
 
 
 def _needs_ask(mem: dict, state: AgentState, rounds: int) -> bool:
@@ -247,7 +263,7 @@ def _needs_ask(mem: dict, state: AgentState, rounds: int) -> bool:
         qs = _symptom_questions_for(cat)
         if len(asked) < min(SYMPTOM_Q_MAX, len(qs)):
             return True
-    if _missing_profile(profile):
+    if _missing_profile(profile, mem.get("asked_profile", [])):
         return True
     return False
 
@@ -267,9 +283,10 @@ def _next_ask_question(mem: dict, state: AgentState) -> str:
             return qs[idx]
     if mem.get("consent") is False:
         return GENERIC_SYMPTOM_QUESTION
-    missing = _missing_profile(profile)
+    missing = _missing_profile(profile, mem.get("asked_profile", []))
     if missing:
         key = missing[0]
+        mem["asked_profile"] = mem.get("asked_profile", []) + [key]
         return ASK_TEMPLATES.get(key, GENERIC_SYMPTOM_QUESTION)
     return GENERIC_SYMPTOM_QUESTION
 
@@ -314,6 +331,7 @@ async def safety_node(state: AgentState, config: RunnableConfig) -> dict:
         mem["consent"] = None
         mem["rounds"] = 0
         mem["asked_symptom_qs"] = []
+        mem["asked_profile"] = []
         mem.pop("last_citations", None)
         _push(config, {"type": "guardrail", "kind": "forget"})
         return {"output": FORGET_RESPONSE, "reason": "forgot", "done": True}
@@ -360,6 +378,10 @@ async def understand_node(state: AgentState) -> dict:
 
     new_facts = parsed.get("facts") or {}
     profile = _merge_facts(mem, new_facts)
+    if intent == "symptom" and not str(profile.get("symptom") or "").strip():
+        first_user = next((t["content"] for t in (transcript or []) if t["role"] == "user"), text)
+        profile["symptom"] = str(first_user).strip()[:120]
+        mem["profile"] = profile
     mem["intent"] = intent
     return {
         "intent": intent,
@@ -447,10 +469,10 @@ async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
         for i, c in enumerate(citations)
     )
     prompt = (
-        "你是医学文献相关性评审员。判断每篇文献与用户问题的主题相关性："
-        "只要属于同一疾病/症状领域（例如都是头痛、都是牙齿/口腔、都是高血压），就算相关，"
-        "不需要精确匹配用户描述的所有细节。"
-        "对每篇文献输出一个 1-5 分的相关度评分（5=高度相关，3=主题相关，1=无关）。"
+        "你是医学文献相关性评审员。判断每篇文献与用户问题的相关性："
+        "只有与用户问题属于同一具体疾病/症状领域且能提供有用信息的文献给 4-5 分；"
+        "仅泛泛相关（如同部位但完全不同的问题）给 3 分；无关给 1-2 分。"
+        "对每篇文献输出一个 1-5 分的相关度评分。"
         '只输出 JSON：{"scores": [按顺序对应每篇文献的分数]}，不要输出其他内容。\n'
         f"用户问题：{question}\n文献列表：\n{items}"
     )
@@ -469,7 +491,7 @@ async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
                 s = int(score)
             except Exception:
                 continue
-            if s >= 3 and i < len(citations):
+            if s >= 4 and i < len(citations):
                 kept.append(citations[i])
         return kept[:3]
     except Exception:
@@ -506,6 +528,9 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
             rerank_q = query_text
             if intent == "symptom":
                 rerank_q = str(facts.get("symptom") or "") or query_text
+                details = str(facts.get("symptom_details") or "").strip()
+                if details:
+                    rerank_q = f"{rerank_q}；{details}"
             citations = await _rerank_citations(rerank_q, citations)
 
     return {"citations": citations[:3]}
@@ -561,9 +586,15 @@ async def synthesize_node(state: AgentState, config: RunnableConfig) -> dict:
 
     triage = None
     if intent == "symptom":
-        m = re.search(r"分诊等级：\s*(🟢|🟡|🔴)", full)
+        m = re.search(r"(🟢|🟡|🔴)", full)
         if m:
             triage = {"🟢": "green", "🟡": "yellow", "🔴": "red"}[m.group(1)]
+        elif "可自行观察" in full:
+            triage = "green"
+        elif "尽快就医" in full or "建议就医" in full or "及时就医" in full:
+            triage = "yellow"
+        elif "立即就医" in full or "急诊" in full or "立即急诊" in full:
+            triage = "red"
 
     return {"output": full, "triage_level": triage, "reason": "answer", "done": True}
 
@@ -599,4 +630,9 @@ def build_graph():
 
 
 agent_graph = build_graph()
+
+
+
+
+
 
