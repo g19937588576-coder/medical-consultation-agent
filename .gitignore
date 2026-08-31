@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
-backend/data/
+backend/data/medical.db
 frontend/node_modules/
 frontend/dist/
 vendor/medical-mcp/node_modules/
@@ -34,3 +34,6 @@ backend/test_*.py
 backend/debug_*.py
 backend/e2e_*.py
 backend/eval_result.txt
+debug_*.py
+*.py.bak
+
