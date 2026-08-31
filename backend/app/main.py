@@ -127,7 +127,7 @@ async def chat(req: ChatReq):
         "session_id": req.session_id,
         "user_input": req.message,
         "transcript": mem.get("transcript", []),
-        "facts": mem.get("facts", {}),
+        "facts": mem.get("profile", {}),
         "question_rounds": mem.get("rounds", 0),
     }
     config = {"configurable": {"event_queue": queue}}
@@ -214,3 +214,4 @@ if _static_dir.exists():
     from fastapi.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
+

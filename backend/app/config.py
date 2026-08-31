@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     tool_cache_ttl: int = 3600  # 秒
 
     # 问诊行为
-    max_question_rounds: int = 5
+    max_question_rounds: int = 8
 
     # 前端来源（CORS）
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
@@ -45,3 +45,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+

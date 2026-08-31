@@ -1,4 +1,4 @@
-"""LangGraph Agent：安全护栏 → 意图理解 → 多轮追问 → 资料查询 → 分级回答。"""
+"""LangGraph Agent：安全护栏 → 命令处理 → 同意征询 → 意图理解 → 多轮追问 → 资料查询 → 分级回答。"""
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +26,7 @@ SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基�
 5. 结尾固定附加一句：以上内容仅为健康信息参考，不能替代医生面诊；如有不适请及时就医。
 6. 如果检索结果不足以回答，请如实说明，并给出就医建议，不要猜测。
 7. 引用编号只能引用「参考资料列表」中实际存在的条目。如果参考资料列表为空（本次没有检索到资料），禁止使用 [1][2] 这类引用标注，应直接说明资料不足。
+8. 必须围绕用户最初描述的症状（「主要症状」字段）作答，即使用户最新一条消息很短。如果检索资料与主要症状不相关，请明确说明"检索到的资料与您描述的症状不直接相关"，并基于常见健康常识给出针对该症状的保守建议（例如牙痛→保持口腔清洁、避免过冷过热刺激、尽快就诊口腔科），严禁给出与用户症状无关的部位建议（如腹部、胸部、腰部等）。
 """
 
 
@@ -34,23 +35,59 @@ class AgentState(TypedDict, total=False):
     user_input: str
     transcript: list[dict]      # 本会话历史
     intent: str                 # symptom / drug / literature / other
-    facts: dict                 # 已收集的问诊信息
+    facts: dict                 # 已收集的健康档案（profile 的别名）
     question_rounds: int
     citations: list[dict]
     triage_level: str | None
     output: str
-    reason: str                 # emergency/refusal/diagnosis/question/answer
+    reason: str                 # forgot/view/emergency/refusal/diagnosis/question/answer
     done: bool
 
 
 # 会话级记忆（进程内，重启即清空；演示足够）
 _session_store: dict[int, dict[str, Any]] = {}
 
+# 健康档案字段：稳定属性先到先得；动态属性后到覆盖
+STABLE_FIELDS = {
+    "age", "gender", "height", "weight", "allergies", "conditions",
+    "family_history", "medications", "lifestyle", "symptom", "pain_type",
+}
+DYNAMIC_FIELDS = {"duration", "severity"}
+
+PROFILE_LABELS = {
+    "age": "年龄", "gender": "性别", "height": "身高", "weight": "体重",
+    "allergies": "过敏史", "conditions": "既往病史", "family_history": "家族史",
+    "medications": "在服药物/保健品", "lifestyle": "生活习惯",
+    "symptom": "主要症状", "duration": "持续时间", "severity": "严重程度",
+    "pain_type": "疼痛性质",
+}
+
+CONSENT_QUESTION = (
+    "在继续之前，我想先确认一件事：为了方便给您更准确的建议，我会记录您"
+    "**本次对话中提到的健康信息**（如年龄、过敏史、病史、用药等）。可以吗？"
+    "您也可以随时说「忘记我的信息」来清除。回复“可以”即可。"
+)
+
+FORGET_PATTERNS = [
+    "忘记我的信息", "清除我的信息", "清除档案", "删除记录",
+    "删除我的信息", "忘掉我的信息", "清除我的记录",
+]
+VIEW_PATTERNS = [
+    "查看我的信息", "看看我的信息", "我提供了什么", "我的档案",
+    "查看档案", "查一下我的信息", "我有什么信息",
+]
+CONSENT_YES = ["可以", "同意", "愿意", "没问题", "当然", "好的", "好呀", "嗯", "行", "记吧", "ok", "okay"]
+CONSENT_NO = ["不用", "不要", "算了", "不必", "拒绝", "不需要", "不了", "no", "不记"]
+
+FORGET_RESPONSE = "好的，我已经清除本次对话中记录的您的健康信息（档案已清空）。之后您可以重新告诉我需要记录的内容。"
+VIEW_EMPTY_RESPONSE = "本次对话中还没有记录任何健康信息。"
+VIEW_HEADER = "您本次对话中已记录的健康信息："
+
 
 def get_session_memory(session_id: int) -> dict[str, Any]:
     mem = _session_store.get(session_id)
     if mem is None:
-        mem = {"facts": {}, "rounds": 0, "intent": None}
+        mem = {"profile": {}, "consent": None, "rounds": 0, "intent": None}
         _session_store[session_id] = mem
     return mem
 
@@ -77,27 +114,80 @@ def _push(config: RunnableConfig | None, event: dict) -> None:
             pass
 
 
+def _merge_facts(mem: dict, new_facts: dict) -> dict:
+    """合并健康档案：稳定属性先到先得，动态属性后到覆盖。"""
+    profile = mem.get("profile", {})
+    for k, v in new_facts.items():
+        val = str(v or "").strip()
+        if not val:
+            continue
+        if k in STABLE_FIELDS and str(profile.get(k) or "").strip():
+            continue
+        profile[k] = val
+    mem["profile"] = profile
+    return profile
+
+
+def _consent_reply(text: str) -> bool | None:
+    """识别用户对同意征询的回复：True=同意，False=拒绝，None=未明确。"""
+    t = text.lower().strip()
+    if any(k in t for k in CONSENT_NO):
+        return False
+    if any(k in t for k in CONSENT_YES):
+        return True
+    return None
+
+
+def _missing_profile(profile: dict) -> list[str]:
+    order = ["age", "allergies", "conditions", "medications", "duration", "severity"]
+    return [k for k in order if not str(profile.get(k) or "").strip()]
+
+
+def _profile_summary(mem: dict) -> str:
+    profile = mem.get("profile") or {}
+    if not profile:
+        return VIEW_EMPTY_RESPONSE
+    lines = []
+    for k, label in PROFILE_LABELS.items():
+        if str(profile.get(k) or "").strip():
+            lines.append(f"· {label}：{profile[k]}")
+    if not lines:
+        return VIEW_EMPTY_RESPONSE
+    return VIEW_HEADER + "\n" + "\n".join(lines) + "\n（如不需要，可随时说「忘记我的信息」清除）"
+
+
 INTENT_PROMPT = """你是问诊信息理解助手。请分析用户最新一条消息（结合上文），输出 JSON：
 {"intent": "symptom" 或 "drug" 或 "literature" 或 "other", "facts": {...}}
 - intent: symptom=描述症状身体不适；drug=询问药品；literature=想了解某主题的研究/文献；other=其他健康话题
-- facts 尽量从对话中提取：{"age":"年龄","duration":"持续多久","severity":"严重程度","allergies":"过敏史","medications":"正在服用的药","symptom":"主要症状"}，未知的填空字符串。
+- facts 尽量从对话中提取，未知的填空字符串：
+{"age":"年龄","gender":"性别","height":"身高","weight":"体重","allergies":"过敏史","conditions":"慢性病/既往病史","family_history":"家族史","medications":"正在服用的药或保健品","lifestyle":"生活习惯(吸烟/饮酒/作息等)","symptom":"主要症状——必须是用户最初描述症状的完整原文","duration":"持续多久","severity":"严重程度","pain_type":"疼痛性质(阵痛/钝痛/刺痛/胀痛等)"}
 只输出 JSON。"""
 
 
-def _missing_facts(facts: dict) -> list[str]:
-    order = ["duration", "severity", "age"]
-    return [k for k in order if not str(facts.get(k) or "").strip()]
-
-
 ASK_TEMPLATES = {
+    "age": "方便告诉我您的年龄吗？不同年龄段需要考虑的方向差别很大。",
+    "allergies": "您有没有药物或食物过敏史？",
+    "conditions": "您是否有已知的慢性病或既往病史（如高血压、糖尿病、哮喘等）？",
+    "medications": "您目前有在服用什么药物或保健品吗？",
     "duration": "这种情况持续多久了？是刚出现，还是已经有一段时间了？",
     "severity": "症状有多严重？是否影响正常生活、睡眠或工作？有没有越来越重？",
-    "age": "方便告诉我您的年龄吗？不同年龄段需要考虑的方向差别很大。",
 }
 
 
 async def safety_node(state: AgentState, config: RunnableConfig) -> dict:
     text = state.get("user_input", "")
+    sid = state.get("session_id", 0)
+    mem = get_session_memory(sid)
+    # 命令优先：清除 / 查看档案
+    if any(k in text for k in FORGET_PATTERNS):
+        mem["profile"] = {}
+        mem["consent"] = None
+        mem["rounds"] = 0
+        _push(config, {"type": "guardrail", "kind": "forget"})
+        return {"output": FORGET_RESPONSE, "reason": "forgot", "done": True}
+    if any(k in text for k in VIEW_PATTERNS):
+        _push(config, {"type": "guardrail", "kind": "view"})
+        return {"output": _profile_summary(mem), "reason": "view", "done": True}
     if safety.check_emergency(text):
         _push(config, {"type": "guardrail", "kind": "emergency"})
         return {"output": safety.EMERGENCY_RESPONSE, "reason": "emergency", "done": True}
@@ -112,6 +202,7 @@ async def safety_node(state: AgentState, config: RunnableConfig) -> dict:
 
 async def understand_node(state: AgentState) -> dict:
     session_id = state.get("session_id", 0)
+    text = state.get("user_input", "")
     transcript = state.get("transcript") or []
     recent = transcript[-6:]
     messages = [
@@ -119,21 +210,30 @@ async def understand_node(state: AgentState) -> dict:
         *recent,
     ]
     try:
-        raw = await chat(messages, temperature=0, json_mode=True, max_tokens=500)
+        raw = await chat(messages, temperature=0, json_mode=True, max_tokens=600)
         parsed = parse_json(raw)
     except Exception:
         parsed = {}
     intent = parsed.get("intent", "other")
     if intent not in {"symptom", "drug", "literature", "other"}:
         intent = "other"
-    new_facts = parsed.get("facts") or {}
+
     mem = get_session_memory(session_id)
-    merged = {**mem.get("facts", {}), **{k: v for k, v in new_facts.items() if str(v or "").strip()}}
-    mem["facts"] = merged
+    # 同意征询结果：仅在尚未确定且用户在回答征询时判定
+    if mem.get("consent") is None:
+        reply = _consent_reply(text)
+        if reply is True:
+            mem["consent"] = True
+        elif reply is False:
+            mem["consent"] = False
+        # 未明确回复则保持 None，等待再次征询
+
+    new_facts = parsed.get("facts") or {}
+    profile = _merge_facts(mem, new_facts)
     mem["intent"] = intent
     return {
         "intent": intent,
-        "facts": merged,
+        "facts": profile,
         "question_rounds": mem.get("rounds", 0),
     }
 
@@ -141,10 +241,13 @@ async def understand_node(state: AgentState) -> dict:
 async def ask_node(state: AgentState, config: RunnableConfig) -> dict:
     session_id = state.get("session_id", 0)
     mem = get_session_memory(session_id)
-    facts = mem.get("facts", {})
-    missing = _missing_facts(facts)
-    key = missing[0] if missing else "duration"
-    question = ASK_TEMPLATES.get(key, "能否再多描述一些症状细节？")
+    if mem.get("consent") is None:
+        question = CONSENT_QUESTION
+    else:
+        profile = mem.get("profile", {})
+        missing = _missing_profile(profile)
+        key = missing[0] if missing else "duration"
+        question = ASK_TEMPLATES.get(key, "能否再多描述一些症状细节？")
     mem["rounds"] = mem.get("rounds", 0) + 1
     return {
         "output": question,
@@ -176,10 +279,10 @@ async def _extract_drugs(text: str) -> list[str]:
 
 
 async def _to_english(text: str, kind: str) -> str:
-    """把中文描述转成适合 PubMed 检索的英文关键词。"""
+    """把中文描述转成适合 PubMed 检索的英文关键词（短关键词，非整句）。"""
     prompt = (
-        f"你是医学检索助手。把下面的{kind}描述转成适合在 PubMed 检索的英文关键词，"
-        "只输出英文关键词本身（可含空格），不要解释，不要加引号。\n"
+        f"你是医学检索助手。把下面的{kind}描述转成适合在 PubMed 检索的简短英文关键词，"
+        "只输出 3-8 个英文关键词（如 headache afternoon adult），不要完整句子、不要标点、不要解释。\n"
         f"输入：{text}"
     )
     try:
@@ -191,12 +294,29 @@ async def _to_english(text: str, kind: str) -> str:
         return text
 
 
+def _literature_query(state: AgentState) -> str:
+    """基于原始症状 + 关键事实组装检索描述，避免用最后一条短消息检索。"""
+    facts = state.get("facts") or {}
+    parts = []
+    symptom = str(facts.get("symptom") or "").strip()
+    if symptom:
+        parts.append(symptom)
+    if str(facts.get("duration") or "").strip():
+        parts.append("持续" + facts["duration"])
+    if str(facts.get("age") or "").strip():
+        parts.append(facts["age"] + "岁")
+    if str(facts.get("pain_type") or "").strip():
+        parts.append(facts["pain_type"])
+    if parts:
+        return "，".join(parts)[:150]
+    return (state.get("user_input") or "")[:120]
+
+
 async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     intent = state.get("intent", "other")
     citations: list[dict] = []
     user_input = state.get("user_input", "")
     facts = state.get("facts") or {}
-    symptom = str(facts.get("symptom") or "").strip() or user_input
 
     if intent == "drug":
         drugs = await _extract_drugs(user_input)
@@ -209,13 +329,25 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     else:
         if intent == "literature":
             en = await _to_english(user_input, "研究主题")
+            retry_src = user_input
+            retry_kind = "检索词"
         elif intent == "symptom":
-            en = await _to_english(symptom, "症状")
+            en = await _to_english(_literature_query(state), "症状")
+            retry_src = str(facts.get("symptom") or "").strip() or user_input
+            retry_kind = "症状"
         else:
             en = await _to_english(user_input, "健康问题")
+            retry_src = user_input
+            retry_kind = "检索词"
         _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在检索 PubMed 医学文献…"})
         result = await mcp_client.call_tool("search-medical-literature", {"query": en, "max_results": 5})
         citations.extend(extract_citations("search-medical-literature", result.get("data") or {}))
+        if not citations and retry_src:
+            en2 = await _to_english(retry_src, retry_kind)
+            if en2 and en2 != en:
+                _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在用更简短的关键词重新检索…"})
+                result2 = await mcp_client.call_tool("search-medical-literature", {"query": en2, "max_results": 5})
+                citations.extend(extract_citations("search-medical-literature", result2.get("data") or {}))
 
     if not citations:
         mem = get_session_memory(state.get("session_id", 0))
@@ -225,6 +357,7 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
         mem["last_citations"] = citations
 
     return {"citations": citations[:5]}
+
 
 def _tool_summary(state: AgentState) -> str:
     citations = state.get("citations") or []
@@ -247,7 +380,7 @@ async def synthesize_node(state: AgentState, config: RunnableConfig) -> dict:
     citations = state.get("citations") or []
 
     fact_lines = []
-    for k, label in [("symptom", "主要症状"), ("duration", "持续时间"), ("severity", "严重程度"), ("age", "年龄"), ("allergies", "过敏史"), ("medications", "正在服药")]:
+    for k, label in PROFILE_LABELS.items():
         if str(facts.get(k) or "").strip():
             fact_lines.append(f"{label}：{facts[k]}")
 
@@ -288,13 +421,17 @@ def _route_after_safety(state: AgentState) -> str:
 
 
 def _route_after_understand(state: AgentState) -> str:
-    mem_intent = state.get("intent")
+    if state.get("intent") != "symptom":
+        return "tools"
     rounds = state.get("question_rounds", 0)
-    if (
-        mem_intent == "symptom"
-        and _missing_facts(state.get("facts") or {})
-        and rounds < settings.max_question_rounds
-    ):
+    if rounds >= settings.max_question_rounds:
+        return "tools"
+    mem = get_session_memory(state.get("session_id", 0))
+    if mem.get("consent") is None:
+        return "ask"  # 先征得同意
+    if mem.get("consent") is False:
+        return "tools"  # 无记忆模式：仅基于当前消息作答
+    if _missing_profile(state.get("facts") or {}):
         return "ask"
     return "tools"
 
@@ -316,8 +453,4 @@ def build_graph():
 
 
 agent_graph = build_graph()
-
-
-
-
 
