@@ -43,4 +43,5 @@ metadata:
 
 ## 参考
 - 项目总结与技术栈：`docs/PROJECT_SUMMARY.md`
-- 简历项目描述：`outputs/简历项目描述.md`
+- 简历项目描述：`docs/简历项目描述.md`
+
