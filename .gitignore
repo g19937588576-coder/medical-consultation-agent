@@ -18,3 +18,8 @@ outputs/
 backend/smoke_test.py
 backend/e2e_test.py
 backend/run_eval.py
+backend/e2e_test2.py
+backend/e2e_tooth.py
+docs/screenshots/debug.png
+backend/debug_*.py
+backend/e2e_verify.py

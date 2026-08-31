@@ -1,4 +1,4 @@
-"""LangGraph Agent：安全护栏 → 命令处理 → 同意征询 → 意图理解 → 多轮追问 → 资料查询 → 分级回答。"""
+"""LangGraph Agent：安全护栏 → 命令处理 → 同意征询 → 对症追问 → 意图理解 → 资料查询 → 分级回答。"""
 from __future__ import annotations
 
 import asyncio
@@ -26,7 +26,8 @@ SYSTEM_PROMPT = """你是「健康咨询助手」，面向中文用户提供基�
 5. 结尾固定附加一句：以上内容仅为健康信息参考，不能替代医生面诊；如有不适请及时就医。
 6. 如果检索结果不足以回答，请如实说明，并给出就医建议，不要猜测。
 7. 引用编号只能引用「参考资料列表」中实际存在的条目。如果参考资料列表为空（本次没有检索到资料），禁止使用 [1][2] 这类引用标注，应直接说明资料不足。
-8. 必须围绕用户最初描述的症状（「主要症状」字段）作答，即使用户最新一条消息很短。如果检索资料与主要症状不相关，请明确说明"检索到的资料与您描述的症状不直接相关"，并基于常见健康常识给出针对该症状的保守建议（例如牙痛→保持口腔清洁、避免过冷过热刺激、尽快就诊口腔科），严禁给出与用户症状无关的部位建议（如腹部、胸部、腰部等）。
+8. 引用纪律：只有当某篇文献与用户的问题/症状直接相关时，才允许引用它。参考资料列表中不相关的文献一律不得引用、不得提及。宁可完全没有引用，也不要引用不相关文献。
+9. 必须围绕用户最初描述的症状（「主要症状」与「补充症状细节」字段）作答，即使用户最新一条消息很短。如果检索资料与主要症状不相关，请明确说明"检索到的资料与您描述的症状不直接相关"，并基于常见健康常识给出针对该症状的保守建议（例如牙痛→保持口腔清洁、避免过冷过热刺激、尽快就诊口腔科），严禁给出与用户症状无关的部位建议（如腹部、胸部、腰部等）。
 """
 
 
@@ -58,8 +59,8 @@ PROFILE_LABELS = {
     "age": "年龄", "gender": "性别", "height": "身高", "weight": "体重",
     "allergies": "过敏史", "conditions": "既往病史", "family_history": "家族史",
     "medications": "在服药物/保健品", "lifestyle": "生活习惯",
-    "symptom": "主要症状", "duration": "持续时间", "severity": "严重程度",
-    "pain_type": "疼痛性质",
+    "symptom": "主要症状", "symptom_details": "补充症状细节",
+    "duration": "持续时间", "severity": "严重程度", "pain_type": "疼痛性质",
 }
 
 CONSENT_QUESTION = (
@@ -82,6 +83,68 @@ CONSENT_NO = ["不用", "不要", "算了", "不必", "拒绝", "不需要", "�
 FORGET_RESPONSE = "好的，我已经清除本次对话中记录的您的健康信息（档案已清空）。之后您可以重新告诉我需要记录的内容。"
 VIEW_EMPTY_RESPONSE = "本次对话中还没有记录任何健康信息。"
 VIEW_HEADER = "您本次对话中已记录的健康信息："
+
+# ===== 对症追问知识库：症状关键词 → 针对性问题 =====
+# 顺序即优先级（更具体的类别在前）
+SYMPTOM_QUESTIONS: list[tuple[str, list[str], list[str]]] = [
+    ("dental", ["牙", "齿", "牙龈", "蛀"], [
+        "牙齿上有没有看到黑点、蛀洞或变色的地方？",
+        "牙龈有没有红肿、出血或鼓包？",
+        "疼痛是遇冷、热、甜食才疼，还是不吃东西也自发地疼？",
+        "有没有夜间加重，或牵扯到脸颊、耳朵的疼痛？",
+    ]),
+    ("abdominal", ["肚子", "腹", "胃", "肚脐", "肠"], [
+        "疼痛的具体位置在哪（上腹、下腹还是肚脐周围）？",
+        "疼痛和吃饭、排便有没有关系？",
+        "有没有伴随腹泻、便秘、恶心、呕吐或发热？",
+    ]),
+    ("cough", ["咳", "痰"], [
+        "是干咳还是有痰？痰是什么颜色？",
+        "咳嗽多久了？白天还是晚上更明显？",
+        "有没有伴随发热、胸痛或气短？",
+    ]),
+    ("fever", ["发烧", "发热", "烧"], [
+        "体温大概多少度？最高到过多少？",
+        "发热几天了？",
+        "有没有伴随咳嗽、咽痛、皮疹或其他不舒服？",
+    ]),
+    ("joint", ["关节", "膝盖", "腰", "肩", "腿"], [
+        "疼痛的部位有没有红肿、发热？",
+        "休息后好转，还是活动后加重？早上起来有没有僵硬？",
+        "近期有没有受过伤或过度运动？",
+    ]),
+    ("throat", ["咽", "喉", "嗓子"], [
+        "吞咽的时候疼不疼？",
+        "有没有声音嘶哑、咳嗽或发热？",
+        "这种情况持续多久了？",
+    ]),
+    ("dizzy", ["晕", "眩"], [
+        "是持续的头晕，还是一阵一阵的眩晕（感觉天旋地转）？",
+        "头晕和起身、转头有没有关系？",
+        "有没有伴随耳鸣、听力下降或恶心？",
+    ]),
+    ("rash", ["疹", "皮"], [
+        "皮疹长在哪些部位？",
+        "有没有瘙痒、疼痛或发热？",
+        "最近有没有接触新东西、吃过新食物或用过新药？",
+    ]),
+    ("fatigue", ["乏", "累", "无力"], [
+        "这种情况持续多久了？",
+        "有没有伴随睡眠不好、食欲下降或体重变化？",
+        "有没有贫血、甲状腺等已知问题？",
+    ]),
+    ("chest", ["胸", "心口"], [
+        "疼痛是压榨感、闷痛还是刺痛？持续多久？",
+        "有没有放射到左臂、后背或下巴？有没有气短、出冷汗？",
+    ]),
+    ("headache", ["头", "偏头痛"], [
+        "疼痛是偏一侧，还是整个头都疼？",
+        "有没有伴随恶心、呕吐、怕光或怕吵？",
+        "疼痛是一跳一跳的搏动感，还是像紧箍一样的压迫感？",
+    ]),
+]
+GENERIC_SYMPTOM_QUESTION = "能不能再多描述一些症状细节？比如具体位置、感觉和什么情况下会加重。"
+SYMPTOM_Q_MAX = 3  # 每类最多追问的对症问题数
 
 
 def get_session_memory(session_id: int) -> dict[str, Any]:
@@ -121,6 +184,11 @@ def _merge_facts(mem: dict, new_facts: dict) -> dict:
         val = str(v or "").strip()
         if not val:
             continue
+        if k == "symptom_details":
+            old = str(profile.get("symptom_details") or "").strip()
+            if val not in old:
+                profile["symptom_details"] = "；".join(x for x in (old, val) if x)
+            continue
         if k in STABLE_FIELDS and str(profile.get(k) or "").strip():
             continue
         profile[k] = val
@@ -138,9 +206,72 @@ def _consent_reply(text: str) -> bool | None:
     return None
 
 
+def _detect_symptom_category(profile: dict, user_input: str) -> str | None:
+    """按主要症状 + 当前消息的关键词匹配出对症类别。"""
+    text = (str(profile.get("symptom") or "") + " " + str(user_input or "")).lower()
+    for cat, keywords, _ in SYMPTOM_QUESTIONS:
+        for kw in keywords:
+            if kw in text:
+                return cat
+    return None
+
+
+def _symptom_questions_for(cat: str) -> list[str]:
+    for c, _, qs in SYMPTOM_QUESTIONS:
+        if c == cat:
+            return qs
+    return []
+
+
 def _missing_profile(profile: dict) -> list[str]:
-    order = ["age", "allergies", "conditions", "medications", "duration", "severity"]
+    order = ["age", "allergies", "duration", "severity", "conditions", "medications"]
     return [k for k in order if not str(profile.get(k) or "").strip()]
+
+
+def _needs_ask(mem: dict, state: AgentState, rounds: int) -> bool:
+    if state.get("intent") != "symptom":
+        return False
+    if rounds >= settings.max_question_rounds:
+        return False
+    if mem.get("consent") is None:
+        return True  # 先征得同意
+    profile = mem.get("profile", {})
+    cat = _detect_symptom_category(profile, state.get("user_input", ""))
+    asked = mem.get("asked_symptom_qs", [])
+    if mem.get("consent") is False:
+        # 无记忆模式：仍基于当前消息做一次对症追问
+        if cat and not asked:
+            return True
+        return False
+    if cat:
+        qs = _symptom_questions_for(cat)
+        if len(asked) < min(SYMPTOM_Q_MAX, len(qs)):
+            return True
+    if _missing_profile(profile):
+        return True
+    return False
+
+
+def _next_ask_question(mem: dict, state: AgentState) -> str:
+    profile = mem.get("profile", {})
+    if mem.get("consent") is None:
+        return CONSENT_QUESTION
+    cat = _detect_symptom_category(profile, state.get("user_input", ""))
+    asked = mem.get("asked_symptom_qs", [])
+    if cat:
+        qs = _symptom_questions_for(cat)
+        remaining = [i for i in range(len(qs)) if i not in asked]
+        if remaining and len(asked) < min(SYMPTOM_Q_MAX, len(qs)):
+            idx = remaining[0]
+            mem["asked_symptom_qs"] = asked + [idx]
+            return qs[idx]
+    if mem.get("consent") is False:
+        return GENERIC_SYMPTOM_QUESTION
+    missing = _missing_profile(profile)
+    if missing:
+        key = missing[0]
+        return ASK_TEMPLATES.get(key, GENERIC_SYMPTOM_QUESTION)
+    return GENERIC_SYMPTOM_QUESTION
 
 
 def _profile_summary(mem: dict) -> str:
@@ -160,7 +291,7 @@ INTENT_PROMPT = """你是问诊信息理解助手。请分析用户最新一条�
 {"intent": "symptom" 或 "drug" 或 "literature" 或 "other", "facts": {...}}
 - intent: symptom=描述症状身体不适；drug=询问药品；literature=想了解某主题的研究/文献；other=其他健康话题
 - facts 尽量从对话中提取，未知的填空字符串：
-{"age":"年龄","gender":"性别","height":"身高","weight":"体重","allergies":"过敏史","conditions":"慢性病/既往病史","family_history":"家族史","medications":"正在服用的药或保健品","lifestyle":"生活习惯(吸烟/饮酒/作息等)","symptom":"主要症状——必须是用户最初描述症状的完整原文","duration":"持续多久","severity":"严重程度","pain_type":"疼痛性质(阵痛/钝痛/刺痛/胀痛等)"}
+{"age":"年龄","gender":"性别","height":"身高","weight":"体重","allergies":"过敏史","conditions":"慢性病/既往病史","family_history":"家族史","medications":"正在服用的药或保健品","lifestyle":"生活习惯(吸烟/饮酒/作息等)","symptom":"主要症状——必须是用户最初描述症状的完整原文","symptom_details":"追问或补充得到的症状细节（如牙上有黑点、遇冷疼、牙龈肿），可多句","duration":"持续多久","severity":"严重程度","pain_type":"疼痛性质(阵痛/钝痛/刺痛/胀痛等)"}
 只输出 JSON。"""
 
 
@@ -178,11 +309,12 @@ async def safety_node(state: AgentState, config: RunnableConfig) -> dict:
     text = state.get("user_input", "")
     sid = state.get("session_id", 0)
     mem = get_session_memory(sid)
-    # 命令优先：清除 / 查看档案
     if any(k in text for k in FORGET_PATTERNS):
         mem["profile"] = {}
         mem["consent"] = None
         mem["rounds"] = 0
+        mem["asked_symptom_qs"] = []
+        mem.pop("last_citations", None)
         _push(config, {"type": "guardrail", "kind": "forget"})
         return {"output": FORGET_RESPONSE, "reason": "forgot", "done": True}
     if any(k in text for k in VIEW_PATTERNS):
@@ -219,14 +351,12 @@ async def understand_node(state: AgentState) -> dict:
         intent = "other"
 
     mem = get_session_memory(session_id)
-    # 同意征询结果：仅在尚未确定且用户在回答征询时判定
     if mem.get("consent") is None:
         reply = _consent_reply(text)
         if reply is True:
             mem["consent"] = True
         elif reply is False:
             mem["consent"] = False
-        # 未明确回复则保持 None，等待再次征询
 
     new_facts = parsed.get("facts") or {}
     profile = _merge_facts(mem, new_facts)
@@ -241,13 +371,7 @@ async def understand_node(state: AgentState) -> dict:
 async def ask_node(state: AgentState, config: RunnableConfig) -> dict:
     session_id = state.get("session_id", 0)
     mem = get_session_memory(session_id)
-    if mem.get("consent") is None:
-        question = CONSENT_QUESTION
-    else:
-        profile = mem.get("profile", {})
-        missing = _missing_profile(profile)
-        key = missing[0] if missing else "duration"
-        question = ASK_TEMPLATES.get(key, "能否再多描述一些症状细节？")
+    question = _next_ask_question(mem, state)
     mem["rounds"] = mem.get("rounds", 0) + 1
     return {
         "output": question,
@@ -279,10 +403,11 @@ async def _extract_drugs(text: str) -> list[str]:
 
 
 async def _to_english(text: str, kind: str) -> str:
-    """把中文描述转成适合 PubMed 检索的英文关键词（短关键词，非整句）。"""
+    """把中文转成 1-2 个核心英文医学概念短语，用 / 分隔（用于 PubMed 检索）。"""
     prompt = (
-        f"你是医学检索助手。把下面的{kind}描述转成适合在 PubMed 检索的简短英文关键词，"
-        "只输出 3-8 个英文关键词（如 headache afternoon adult），不要完整句子、不要标点、不要解释。\n"
+        f"你是医学检索助手。把下面的{kind}描述提炼成 1-2 个核心英文医学概念短语，"
+        "用 / 分隔（例如：toothache / dental pain；或 hypertension treatment）。"
+        "不要年龄、时长、程度等限定词，不要完整句子，不要标点。\n"
         f"输入：{text}"
     )
     try:
@@ -294,22 +419,61 @@ async def _to_english(text: str, kind: str) -> str:
         return text
 
 
+async def _build_pubmed_query(text: str, kind: str) -> str:
+    """构造 PubMed 查询：核心概念加引号与字段标签，避免过度 AND 与词义映射跑偏。"""
+    concepts = await _to_english(text, kind)
+    parts = [p.strip() for p in re.split(r"[/／,，;；]+", concepts) if p.strip()]
+    if not parts:
+        return text
+    clauses = [f'"{p}"[Title/Abstract]' for p in parts[:2]]
+    return " OR ".join(clauses)
+
+
 def _literature_query(state: AgentState) -> str:
-    """基于原始症状 + 关键事实组装检索描述，避免用最后一条短消息检索。"""
+    """基于原始症状组装检索描述（不加年龄/时长等限定词，避免过度 AND）。"""
     facts = state.get("facts") or {}
-    parts = []
     symptom = str(facts.get("symptom") or "").strip()
     if symptom:
-        parts.append(symptom)
-    if str(facts.get("duration") or "").strip():
-        parts.append("持续" + facts["duration"])
-    if str(facts.get("age") or "").strip():
-        parts.append(facts["age"] + "岁")
-    if str(facts.get("pain_type") or "").strip():
-        parts.append(facts["pain_type"])
-    if parts:
-        return "，".join(parts)[:150]
+        return symptom[:120]
     return (state.get("user_input") or "")[:120]
+
+
+async def _rerank_citations(question: str, citations: list[dict]) -> list[dict]:
+    """LLM 相关性重排：按主题相关度打分（1-5），保留 ≥3 分的文献（最多 3 条）。"""
+    if not citations:
+        return []
+    items = "\n".join(
+        f"{i + 1}. {c.get('title', '')} —— 摘要：{(c.get('snippet') or '')[:300]}"
+        for i, c in enumerate(citations)
+    )
+    prompt = (
+        "你是医学文献相关性评审员。判断每篇文献与用户问题的主题相关性："
+        "只要属于同一疾病/症状领域（例如都是头痛、都是牙齿/口腔、都是高血压），就算相关，"
+        "不需要精确匹配用户描述的所有细节。"
+        "对每篇文献输出一个 1-5 分的相关度评分（5=高度相关，3=主题相关，1=无关）。"
+        '只输出 JSON：{"scores": [按顺序对应每篇文献的分数]}，不要输出其他内容。\n'
+        f"用户问题：{question}\n文献列表：\n{items}"
+    )
+    try:
+        raw = await chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0,
+            json_mode=True,
+            max_tokens=200,
+        )
+        parsed = parse_json(raw)
+        scores = parsed.get("scores") or []
+        kept = []
+        for i, score in enumerate(scores):
+            try:
+                s = int(score)
+            except Exception:
+                continue
+            if s >= 3 and i < len(citations):
+                kept.append(citations[i])
+        return kept[:3]
+    except Exception:
+        return citations[:3]
 
 
 async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
@@ -328,35 +492,23 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
             citations.extend(extract_citations("search-drugs", result.get("data") or {}))
     else:
         if intent == "literature":
-            en = await _to_english(user_input, "研究主题")
-            retry_src = user_input
-            retry_kind = "检索词"
+            query_text, kind = user_input, "研究主题"
         elif intent == "symptom":
-            en = await _to_english(_literature_query(state), "症状")
-            retry_src = str(facts.get("symptom") or "").strip() or user_input
-            retry_kind = "症状"
+            query_text, kind = _literature_query(state), "症状"
         else:
-            en = await _to_english(user_input, "健康问题")
-            retry_src = user_input
-            retry_kind = "检索词"
+            query_text, kind = user_input, "健康问题"
+        pubmed_q = await _build_pubmed_query(query_text, kind)
         _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在检索 PubMed 医学文献…"})
-        result = await mcp_client.call_tool("search-medical-literature", {"query": en, "max_results": 5})
+        result = await mcp_client.call_tool("search-medical-literature", {"query": pubmed_q, "max_results": 5})
         citations.extend(extract_citations("search-medical-literature", result.get("data") or {}))
-        if not citations and retry_src:
-            en2 = await _to_english(retry_src, retry_kind)
-            if en2 and en2 != en:
-                _push(config, {"type": "tool_call", "tool": "search-medical-literature", "label": "正在用更简短的关键词重新检索…"})
-                result2 = await mcp_client.call_tool("search-medical-literature", {"query": en2, "max_results": 5})
-                citations.extend(extract_citations("search-medical-literature", result2.get("data") or {}))
+        # 相关性过滤（核心防线）：只保留与用户问题直接相关的文献
+        if citations:
+            rerank_q = query_text
+            if intent == "symptom":
+                rerank_q = str(facts.get("symptom") or "") or query_text
+            citations = await _rerank_citations(rerank_q, citations)
 
-    if not citations:
-        mem = get_session_memory(state.get("session_id", 0))
-        citations = mem.get("last_citations", [])
-    else:
-        mem = get_session_memory(state.get("session_id", 0))
-        mem["last_citations"] = citations
-
-    return {"citations": citations[:5]}
+    return {"citations": citations[:3]}
 
 
 def _tool_summary(state: AgentState) -> str:
@@ -424,14 +576,8 @@ def _route_after_understand(state: AgentState) -> str:
     if state.get("intent") != "symptom":
         return "tools"
     rounds = state.get("question_rounds", 0)
-    if rounds >= settings.max_question_rounds:
-        return "tools"
     mem = get_session_memory(state.get("session_id", 0))
-    if mem.get("consent") is None:
-        return "ask"  # 先征得同意
-    if mem.get("consent") is False:
-        return "tools"  # 无记忆模式：仅基于当前消息作答
-    if _missing_profile(state.get("facts") or {}):
+    if _needs_ask(mem, state, rounds):
         return "ask"
     return "tools"
 
