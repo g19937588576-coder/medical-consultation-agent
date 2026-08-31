@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+backend/data/
+frontend/node_modules/
+frontend/dist/
+vendor/medical-mcp/node_modules/
+node_modules/
+.DS_Store
+*.log
+
+# 本地专用 / 构建产物 / 交付副本（不入库）
+backend/static/
+vendor/
+tools/
+outputs/
+backend/smoke_test.py
+backend/e2e_test.py
+backend/run_eval.py

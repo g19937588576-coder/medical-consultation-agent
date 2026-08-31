@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: medical-agent
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com/v1
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: deepseek-chat
+      - key: MCP_SERVER_COMMAND
+        value: medical-mcp
+      - key: MCP_SERVER_ARGS
+        value: '[]'
+      - key: DB_PATH
+        value: /tmp/medical.db
